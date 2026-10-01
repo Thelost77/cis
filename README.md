@@ -36,7 +36,7 @@ go install github.com/Thelost77/cis@latest
 Install a specific release:
 
 ```sh
-go install github.com/Thelost77/cis@v0.1.0
+go install github.com/Thelost77/cis@v0.2.0
 ```
 
 From a checkout, use `go build -o cis .`.
