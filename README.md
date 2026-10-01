@@ -112,6 +112,8 @@ cis --version
 - A wrong password on a file does not change the file.
 - A wrong password on a printed secret prints data that is not the original text.
 - The tool keeps the original file mode.
+- The tool keeps one file in memory at a time. Memory use is approximately the size of the largest file.
+- With input from a pipe, the tool does not know the input size. Memory use can then be approximately 2.5 times the input size.
 - The tool hides notes from casual view. It does not stop a person who tries many passwords.
 
 ### Folders

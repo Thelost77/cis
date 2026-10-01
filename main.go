@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 
@@ -68,16 +69,15 @@ func encryptNote() error {
 	if err != nil {
 		return err
 	}
-	blob, err := encrypt(plain, password)
+	sealed, err := encrypt(plain, stdinSize(), password)
 	if err != nil {
 		return err
 	}
-	fmt.Println(blob)
-	return nil
+	return writeSecret(os.Stdout, sealed)
 }
 
 func decryptNote() error {
-	blob, err := readSecret()
+	secret, err := readSecret()
 	if err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func decryptNote() error {
 	if err != nil {
 		return err
 	}
-	plain, err := decrypt(blob, password)
+	plain, err := decrypt(secret, stdinSize(), password)
 	if err != nil {
 		return err
 	}
@@ -106,19 +106,13 @@ func encryptFile(path string) error {
 	if info.IsDir() {
 		return encryptDir(path)
 	}
-	plain, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
 	password, err := askPassword()
 	if err != nil {
 		return err
 	}
-	blob, err := encrypt(plain, password)
-	if err != nil {
-		return err
-	}
-	return replaceFile(path, []byte(blob+"\n"), info.Mode().Perm())
+	return replaceFiles([]string{path}, writeSecret, func(f *os.File, size int64) ([]byte, error) {
+		return encrypt(f, size, password)
+	})
 }
 
 func decryptFile(path string) error {
@@ -129,19 +123,13 @@ func decryptFile(path string) error {
 	if info.IsDir() {
 		return decryptDir(path)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
 	password, err := askPassword()
 	if err != nil {
 		return err
 	}
-	plain, err := decryptAuthenticated(string(data), password)
-	if err != nil {
-		return err
-	}
-	return replaceFile(path, plain, info.Mode().Perm())
+	return replaceFiles([]string{path}, writePlain, func(f *os.File, size int64) ([]byte, error) {
+		return decryptAuthenticated(f, size, password)
+	})
 }
 
 func encryptDir(root string) error {
@@ -153,16 +141,15 @@ func encryptDir(root string) error {
 	if err != nil {
 		return err
 	}
-	return replaceFiles(paths, func(data []byte) ([]byte, error) {
+	return replaceFiles(paths, writeSecret, func(f *os.File, size int64) ([]byte, error) {
 		// A second run after an interrupted run must not encrypt a file twice.
-		if _, err := decryptAuthenticated(string(data), password); err == nil {
+		if _, err := decryptAuthenticated(f, size, password); err == nil {
 			return nil, errAlreadyEncrypted
 		}
-		blob, err := encrypt(data, password)
-		if err != nil {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
-		return []byte(blob + "\n"), nil
+		return encrypt(f, size, password)
 	})
 }
 
@@ -175,8 +162,8 @@ func decryptDir(root string) error {
 	if err != nil {
 		return err
 	}
-	return replaceFiles(paths, func(data []byte) ([]byte, error) {
-		return decryptAuthenticated(string(data), password)
+	return replaceFiles(paths, writePlain, func(f *os.File, size int64) ([]byte, error) {
+		return decryptAuthenticated(f, size, password)
 	})
 }
 
@@ -202,9 +189,18 @@ func regularFiles(root string) ([]string, error) {
 	return paths, nil
 }
 
+// A convertFunc reads the content of f, which has size bytes, and returns the
+// new content.
+type convertFunc func(f *os.File, size int64) ([]byte, error)
+
+func writePlain(w io.Writer, plain []byte) error {
+	_, err := w.Write(plain)
+	return err
+}
+
 // replaceFiles writes every result to a temp file before it renames any temp
 // file. A failure before the first rename leaves all files unchanged.
-func replaceFiles(paths []string, convert func([]byte) ([]byte, error)) error {
+func replaceFiles(paths []string, write func(io.Writer, []byte) error, convert convertFunc) error {
 	type stagedFile struct{ tmp, path string }
 	var staged []stagedFile
 	defer func() {
@@ -213,22 +209,10 @@ func replaceFiles(paths []string, convert func([]byte) ([]byte, error)) error {
 		}
 	}()
 	for _, path := range paths {
-		info, err := os.Stat(path)
-		if err != nil {
-			return err
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		out, err := convert(data)
-		if err == errAlreadyEncrypted {
+		tmp, err := stageFile(path, write, convert)
+		if errors.Is(err, errAlreadyEncrypted) {
 			continue
 		}
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-		tmp, err := stageFile(path, out, info.Mode().Perm())
 		if err != nil {
 			return err
 		}
@@ -244,20 +228,27 @@ func replaceFiles(paths []string, convert func([]byte) ([]byte, error)) error {
 	return nil
 }
 
-func replaceFile(path string, data []byte, mode os.FileMode) error {
-	tmp, err := stageFile(path, data, mode)
+// stageFile converts the content of path and writes the result to a temp file
+// next to path. It returns the name of the temp file.
+func stageFile(path string, write func(io.Writer, []byte) error, convert convertFunc) (string, error) {
+	in, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return "", err
 	}
-	return nil
-}
-
-// stageFile writes data to a temp file next to path and returns its name.
-func stageFile(path string, data []byte, mode os.FileMode) (string, error) {
+	// The buffers of the previous file are garbage now. Free them before a
+	// large file, so that peak memory stays near the size of one file.
+	if info.Size() >= 16<<20 {
+		runtime.GC()
+	}
+	data, err := convert(in, info.Size())
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
 	f, err := os.CreateTemp(filepath.Dir(path), ".cis-*")
 	if err != nil {
 		return "", err
@@ -269,11 +260,11 @@ func stageFile(path string, data []byte, mode os.FileMode) (string, error) {
 			_ = os.Remove(tmp)
 		}
 	}()
-	if err := f.Chmod(mode); err != nil {
+	if err := f.Chmod(info.Mode().Perm()); err != nil {
 		_ = f.Close()
 		return "", err
 	}
-	if _, err := f.Write(data); err != nil {
+	if err := write(f, data); err != nil {
 		_ = f.Close()
 		return "", err
 	}
@@ -288,32 +279,38 @@ func stageFile(path string, data []byte, mode os.FileMode) (string, error) {
 	return tmp, nil
 }
 
-func readPhrase() ([]byte, error) {
+func readPhrase() (io.Reader, error) {
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Fprint(os.Stderr, "Phrase: ")
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
-		return []byte(strings.TrimRight(line, "\r\n")), nil
+		return strings.NewReader(strings.TrimRight(line, "\r\n")), nil
 	}
-	return io.ReadAll(os.Stdin)
+	return os.Stdin, nil
 }
 
-func readSecret() (string, error) {
+func readSecret() (io.Reader, error) {
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Fprint(os.Stderr, "Secret: ")
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && err != io.EOF {
-			return "", err
+			return nil, err
 		}
-		return strings.TrimSpace(line), nil
+		return strings.NewReader(line), nil
 	}
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return "", err
+	return os.Stdin, nil
+}
+
+// stdinSize returns the size of stdin if stdin is a regular file. If not, it
+// returns 0.
+func stdinSize() int64 {
+	info, err := os.Stdin.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return 0
 	}
-	return strings.TrimSpace(string(data)), nil
+	return info.Size()
 }
 
 func readPassword() (string, error) {
