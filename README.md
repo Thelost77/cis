@@ -12,6 +12,7 @@ The tool then encodes the result in Base64.
 - Encrypt a short note and print a Base64 secret
 - Decrypt a Base64 secret and print the note
 - Replace a file in place
+- Replace each file in a folder with one command
 - Ask for the password. Do not take the password as an argument
 - Keep the original file mode
 - Leave a file unchanged when the password is wrong
@@ -76,6 +77,21 @@ cis dec notes.txt
 
 The tool replaces `notes.txt` with the original text.
 
+Encrypt each file in a folder:
+
+```sh
+cis enc notes
+```
+
+The tool asks for the password one time.
+The tool then replaces each file in `notes` and in its subfolders.
+
+Decrypt each file in a folder:
+
+```sh
+cis dec notes
+```
+
 Pipe a note:
 
 ```sh
@@ -97,6 +113,24 @@ cis --version
 - A wrong password on a printed secret prints data that is not the original text.
 - The tool keeps the original file mode.
 - The tool hides notes from casual view. It does not stop a person who tries many passwords.
+
+### Folders
+
+- The tool replaces each regular file in the folder and in its subfolders.
+- The tool does not change symbolic links.
+- The tool does not hide file names or the folder structure.
+- The tool writes all results to temporary files before it replaces a file.
+- If an error occurs for one file, the tool changes no file.
+- A wrong password on a folder changes no file.
+- `cis enc` does not change a file that the same password can decrypt.
+- The temporary files of `cis enc` use approximately 1.33 times the size of the folder.
+
+If the tool stops while it replaces the files, some files stay in the old state.
+To correct this condition, do these steps:
+
+1. Delete the files with names that start with `.cis-`. These are temporary files.
+2. Use `cis enc` on the folder with the same password. All files are then encrypted.
+3. If you want the original files, use `cis dec` on the folder.
 
 ## License
 

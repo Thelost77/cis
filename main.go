@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -15,6 +17,8 @@ import (
 const version = "dev"
 
 var askPassword = readPassword
+
+var errAlreadyEncrypted = errors.New("already encrypted")
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -99,6 +103,9 @@ func encryptFile(path string) error {
 	if err != nil {
 		return err
 	}
+	if info.IsDir() {
+		return encryptDir(path)
+	}
 	plain, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -119,6 +126,9 @@ func decryptFile(path string) error {
 	if err != nil {
 		return err
 	}
+	if info.IsDir() {
+		return decryptDir(path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -134,10 +144,123 @@ func decryptFile(path string) error {
 	return replaceFile(path, plain, info.Mode().Perm())
 }
 
-func replaceFile(path string, data []byte, mode os.FileMode) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".cis-*")
+func encryptDir(root string) error {
+	paths, err := regularFiles(root)
 	if err != nil {
 		return err
+	}
+	password, err := askPassword()
+	if err != nil {
+		return err
+	}
+	return replaceFiles(paths, func(data []byte) ([]byte, error) {
+		// A second run after an interrupted run must not encrypt a file twice.
+		if _, err := decryptAuthenticated(string(data), password); err == nil {
+			return nil, errAlreadyEncrypted
+		}
+		blob, err := encrypt(data, password)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(blob + "\n"), nil
+	})
+}
+
+func decryptDir(root string) error {
+	paths, err := regularFiles(root)
+	if err != nil {
+		return err
+	}
+	password, err := askPassword()
+	if err != nil {
+		return err
+	}
+	return replaceFiles(paths, func(data []byte) ([]byte, error) {
+		return decryptAuthenticated(string(data), password)
+	})
+}
+
+// regularFiles returns the regular files below root. It does not follow
+// symbolic links.
+func regularFiles(root string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("%s: no regular files", root)
+	}
+	return paths, nil
+}
+
+// replaceFiles writes every result to a temp file before it renames any temp
+// file. A failure before the first rename leaves all files unchanged.
+func replaceFiles(paths []string, convert func([]byte) ([]byte, error)) error {
+	type stagedFile struct{ tmp, path string }
+	var staged []stagedFile
+	defer func() {
+		for _, s := range staged {
+			_ = os.Remove(s.tmp)
+		}
+	}()
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		out, err := convert(data)
+		if err == errAlreadyEncrypted {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		tmp, err := stageFile(path, out, info.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		staged = append(staged, stagedFile{tmp, path})
+	}
+	total := len(staged)
+	for len(staged) > 0 {
+		if err := os.Rename(staged[0].tmp, staged[0].path); err != nil {
+			return fmt.Errorf("replaced %d of %d files: %w", total-len(staged), total, err)
+		}
+		staged = staged[1:]
+	}
+	return nil
+}
+
+func replaceFile(path string, data []byte, mode os.FileMode) error {
+	tmp, err := stageFile(path, data, mode)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// stageFile writes data to a temp file next to path and returns its name.
+func stageFile(path string, data []byte, mode os.FileMode) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), ".cis-*")
+	if err != nil {
+		return "", err
 	}
 	tmp := f.Name()
 	ok := false
@@ -148,24 +271,21 @@ func replaceFile(path string, data []byte, mode os.FileMode) error {
 	}()
 	if err := f.Chmod(mode); err != nil {
 		_ = f.Close()
-		return err
+		return "", err
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		return err
+		return "", err
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		return err
+		return "", err
 	}
 	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
+		return "", err
 	}
 	ok = true
-	return nil
+	return tmp, nil
 }
 
 func readPhrase() ([]byte, error) {
@@ -221,11 +341,12 @@ func usageError() error {
 
 func usage() string {
 	return strings.TrimSpace(`
-Usage: cis enc [file]
-       cis dec [file]
+Usage: cis enc [file|folder]
+       cis dec [file|folder]
 
 enc encrypts a note or replaces a file in place.
 dec decrypts a note or replaces a file in place.
+With a folder, enc and dec replace each file in the folder.
 
 The tool asks for the password.
 `)
